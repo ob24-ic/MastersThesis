@@ -1,11 +1,8 @@
 import numpy as np
-from scipy.stats import norm, expon
+from scipy.stats import norm, expon, gaussian_kde
 from numpy import exp, log
 from sklearn.linear_model import LogisticRegression
 import matplotlib.pyplot as plt
-
-x = [53, 57, 58, 63, 66, 67, 67, 67, 68, 69, 70, 70, 70, 70, 72, 73, 75, 75, 76, 76, 78, 79, 81]
-y = [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0]
 
 
 def compute_likelihood(alpha, beta):
@@ -55,6 +52,11 @@ def accept_probability(alpha, alpha_prop, beta, beta_prop, b):
 
 
 def run_MH(n_iters, alpha0=None, beta0=None, logging=False):
+    """
+    Runs the Metropolis-Hastings algorithm on this problem for a specified number of iterations.
+    Can also specifiy the initial guess alpha and beta.
+    """
+
     # first we need to find b we fit a standard logistic regression from sklearn and use the intercept M MLE as our b
     # Dont use any regularisation
     model = LogisticRegression(fit_intercept=True, penalty=None, solver='lbfgs', max_iter=1000)
@@ -98,15 +100,112 @@ def run_MH(n_iters, alpha0=None, beta0=None, logging=False):
 
         samples.append((alpha, beta))
 
-    return np.array(samples)
+    return np.array(samples).T
 
 
-chain = run_MH(n_iters=2000, alpha0=0, beta0=0, logging=True)
+def generate_plots(chain):
+    """ For a given chain we generate the plots similar to those in the lecture notes
+    The chain should be a numpy array of 2 x niters
+    """
 
-fig, (ax1, ax2) = plt.subplots(2,1, sharex=True)
-ax1.plot(chain[:,0]); ax1.set_ylabel('alpha')
-ax2.plot(chain[:,1]); ax2.set_ylabel('beta'); ax2.set_xlabel('iter')
-plt.show()
+    # ensure it’s a NumPy array
+    chain = np.asarray(chain)
+
+    # check it’s 2-D
+    if chain.ndim != 2:
+        raise ValueError(f"`chain` must be 2-D, got ndim={chain.ndim}")
+
+    # check the first dimension is size 2
+    if chain.shape[0] != 2:
+        raise ValueError(f"`chain` must have shape (2, n_iters), got {chain.shape}")
+
+    # unpack
+    alpha_samps = chain[0, :]
+    beta_samps = chain[1, :]
+
+    # Joint scatter + KDE contours
+    plt.figure(figsize=(5, 5))
+    plt.scatter(alpha_samps, beta_samps, s=3, alpha=0.3, color='black')
+
+    # build a kernel density estimate over the 2D points
+    xy = np.vstack([alpha_samps, beta_samps])
+    kde = gaussian_kde(xy)
+    a_min, a_max = alpha_samps.min(), alpha_samps.max()
+    b_min, b_max = beta_samps.min(), beta_samps.max()
+    A, B = np.meshgrid(np.linspace(a_min, a_max, 100),
+                       np.linspace(b_min, b_max, 100))
+    Z = kde(np.vstack([A.ravel(), B.ravel()])).reshape(A.shape)
+
+    plt.contour(A, B, Z, colors='blue', linewidths=1)
+    plt.xlabel('Intercept α')
+    plt.ylabel('Slope β')
+    plt.title('Joint posterior + KDE contours')
+    plt.tight_layout()
+    plt.show()
+
+    # Marginals + running-mean traces
+    burn = len(alpha_samps) // 10  # discard first 10% as burn-in
+    a_post = alpha_samps[burn:]
+    b_post = beta_samps[burn:]
+
+    # compute running means
+    rm_alpha = np.cumsum(a_post) / np.arange(1, len(a_post) + 1)
+    rm_beta = np.cumsum(b_post) / np.arange(1, len(b_post) + 1)
+
+    fig, axes = plt.subplots(2, 2, figsize=(10, 6),
+                             gridspec_kw={'width_ratios': [1, 1], 'height_ratios': [1, 1]})
+
+    # histogram of alpha
+    axes[0, 0].hist(a_post, bins=30, density=True)
+    axes[0, 0].set_title('Posterior of α')
+    axes[0, 0].set_xlabel('α')
+    axes[0, 0].set_ylabel('Density')
+
+    # running mean of alpha
+    axes[0, 1].plot(rm_alpha)
+    axes[0, 1].set_title('Running mean of α')
+    axes[0, 1].set_xlabel('Iteration (post burn-in)')
+    axes[0, 1].set_ylabel('Mean α')
+
+    # histogram of beta
+    axes[1, 0].hist(b_post, bins=30, density=True)
+    axes[1, 0].set_title('Posterior of β')
+    axes[1, 0].set_xlabel('β')
+    axes[1, 0].set_ylabel('Density')
+
+    # running mean of beta
+    axes[1, 1].plot(rm_beta)
+    axes[1, 1].set_title('Running mean of β')
+    axes[1, 1].set_xlabel('Iteration (post burn-in)')
+    axes[1, 1].set_ylabel('Mean β')
+
+    plt.tight_layout()
+    plt.show()
+
+    # Predictive histograms at fixed temperatures
+    temps = [65, 45, 31]  # temperatures in °F
+    fig, axs = plt.subplots(1, len(temps), figsize=(5 * len(temps), 4))
+
+    for ax, xstar in zip(axs, temps):
+        p_star = 1 / (1 + np.exp(-(alpha_samps + beta_samps * xstar)))
+        ax.hist(p_star, bins=30, density=True)
+        ax.set_title(f'Failure Prob @ {xstar}°F')
+        ax.set_xlim(0, 1)
+        ax.set_xlabel('p')
+        ax.set_ylabel('Density')
+
+    plt.tight_layout()
+    plt.show()
+
+    return None
 
 
 
+
+
+if __name__ == '__main__':
+    x = [53, 57, 58, 63, 66, 67, 67, 67, 68, 69, 70, 70, 70, 70, 72, 73, 75, 75, 76, 76, 78, 79, 81]
+    y = [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0]
+
+    chain = run_MH(n_iters=2000, alpha0=None, beta0=None, logging=True)
+    generate_plots(chain)
