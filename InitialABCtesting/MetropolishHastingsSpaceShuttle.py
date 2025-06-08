@@ -71,14 +71,8 @@ def run_MH(n_iters, alpha0=None, beta0=None, logging=False):
         print(f"found alpha MLE = {alpha_hat}, beta MLE = {beta_hat}, b = {b}")
 
     # if specify alpha and beta use those initial values else use MLE
-    if alpha0 is not None:
-        alpha = alpha0
-    else:
-        alpha = alpha_hat
-    if beta0 is not None:
-        beta = beta0
-    else:
-        beta = beta_hat
+    alpha = alpha0 if alpha0 is not None else alpha_hat
+    beta = beta0 if beta0 is not None else beta_hat
 
     # Define our proposal distributions which we will draw from
     alpha_proposal_distribution = expon(scale=b)
@@ -194,6 +188,10 @@ def generate_plots(chain):
         ax.set_xlabel('p')
         ax.set_ylabel('Density')
 
+        # Zoom in to the 1st–99th percentile of p_star
+        qlow, qhigh = np.quantile(p_star, [0.01, 0.99])
+        ax.set_xlim(qlow, qhigh)
+
     plt.tight_layout()
     plt.show()
 
@@ -201,11 +199,9 @@ def generate_plots(chain):
 
 
 
-
-
 if __name__ == '__main__':
     x = [53, 57, 58, 63, 66, 67, 67, 67, 68, 69, 70, 70, 70, 70, 72, 73, 75, 75, 76, 76, 78, 79, 81]
     y = [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0]
 
-    chain = run_MH(n_iters=2000, alpha0=None, beta0=None, logging=True)
+    chain = run_MH(n_iters=2000, alpha0=None, beta0=None, logging=False)
     generate_plots(chain)
