@@ -3,6 +3,7 @@ from sklearn.datasets import load_diabetes
 import pandas as pd
 import numpy as np
 from scipy.stats import laplace, uniform, norm, expon
+import matplotlib.pyplot as plt
 
 def distance(xobs, xsim):
     """Function to calculate the distance between observations and simulated observations given by RMSD / IQR"""
@@ -13,15 +14,15 @@ def distance(xobs, xsim):
     rmsd = np.sqrt(np.sum((xobs - xsim) ** 2) / J)
 
     # Calculate the IQR
-    xobs_sorted = np.sort(xobs,axis=0)
-    IQR = xobs_sorted[int(3*J/4),0] - xobs_sorted[int(J/4),0]
+    xsim_sorted = np.sort(xobs,axis=0)
+    IQR = xsim_sorted[int(3*J/4),0] - xsim_sorted[int(J/4),0]
     return rmsd / IQR
 
 def simulate_model(features, thetas):
     """returns xsim as a column vector"""
     return (features @ thetas).reshape(-1, 1)
 
-def linear_SLInG(features, xobs, n_iters = 10, delta_abc = 0.01, delta_min = 0.01, delta_max=10, grace_period_ratio=0.05, burn_period_ratio=0.1, sigma_initial = 1, lambda_rate=1, logging=False):
+def linear_SLInG(features, xobs, n_iters = 500, delta_abc = 0.01, delta_min = 0.01, delta_max=10, grace_period_ratio=0.05, burn_period_ratio=0.1, sigma_initial = 1, lambda_rate=1, logging=False):
     """
     Linear SLInG based on algorithm from notes
     :param features:
@@ -46,7 +47,7 @@ def linear_SLInG(features, xobs, n_iters = 10, delta_abc = 0.01, delta_min = 0.0
     # Initialise epsilon and theta and sigmas (squared)
     epsilons = np.zeros((n_iters, K))
     thetas   = np.zeros((n_iters, K))
-    epsilons[0] = uniform(loc=0, scale=1).rvs(size=K)
+    epsilons[0] = np.ones(K) #uniform(loc=0, scale=1).rvs(size=K)
     thetas[0] = laplace(loc=0, scale=epsilons[0]).rvs(size=K)
     sigmas = sigma_initial * np.ones(K)
 
@@ -56,7 +57,7 @@ def linear_SLInG(features, xobs, n_iters = 10, delta_abc = 0.01, delta_min = 0.0
     # Compute dist the initial distance
     dist = distance(xobs, xsim)
 
-    delta_abc = max(delta_min, dist / delta_max)
+    # delta_abc = max(delta_min, dist / delta_max)
 
     # main loop
     for i in range(1, n_iters):
@@ -147,7 +148,51 @@ if __name__ == '__main__':
     features_matrix = np.array(diabetes.data)
 
     # Run the sling algorithm
-    theta_final = linear_SLInG(features_matrix, target, n_iters=1000)
+    theta_final = linear_SLInG(features_matrix, target, n_iters=10)
 
     # Plot
+    # 1) sample for each δ
+    all_summaries = []
+    for δ in [0.015, 0.02, 0.035, 0.045]:
+        chain = linear_SLInG(features_matrix, target,  delta_abc = δ)
+        post = chain[int(0.2 * len(chain)):]  # drop 20%
+        means = post.mean(0)
+        low = np.percentile(post, 2.5, 0)
+        high = np.percentile(post, 97.5, 0)
+        all_summaries.append((δ, means, low, high))
 
+    # 2) standard deviations of original features
+    sds = features_matrix.std(axis=0, ddof=1)
+
+    # 3) plotting
+
+    var_names = diabetes.feature_names  # length K
+    K = len(var_names)
+    y_pos = np.arange(K)
+
+    plt.figure(figsize=(6, 4))
+    colors = ['C0', 'C1', 'C2', 'C3']
+    markers = ['^', 's', 'o', 'd']
+
+    for (δ, means, low, hi), c, m in zip(all_summaries, colors, markers):
+        # standardize if needed:
+        means_s = means * sds
+        low_s = low * sds
+        hi_s = hi * sds
+
+        # plot interval bars
+        plt.errorbar(means_s, y_pos,
+                     xerr=[means_s - low_s, hi_s - means_s],
+                     fmt=m, color=c, label=f'δₐᵦ꜀={δ}',
+                     capsize=4, markersize=5, linestyle='none')
+
+    # vertical line at zero
+    plt.axvline(0, color='k', lw=1, linestyle='--')
+
+    plt.yticks(y_pos, var_names)
+    plt.xlabel("Standardized coefficients")
+    plt.ylim(-1, K)
+    plt.legend(loc='upper right', frameon=False)
+    plt.title("SLInG posterior for diabetes data")
+    plt.tight_layout()
+    plt.show()
