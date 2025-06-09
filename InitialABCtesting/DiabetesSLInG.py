@@ -4,6 +4,7 @@ import pandas as pd
 import numpy as np
 from scipy.stats import laplace, uniform, norm, expon
 import matplotlib.pyplot as plt
+from sklearn.preprocessing import StandardScaler
 
 def distance(xobs, xsim):
     """Function to calculate the distance between observations and simulated observations given by RMSD / IQR"""
@@ -14,15 +15,15 @@ def distance(xobs, xsim):
     rmsd = np.sqrt(np.sum((xobs - xsim) ** 2) / J)
 
     # Calculate the IQR
-    xsim_sorted = np.sort(xobs,axis=0)
-    IQR = xsim_sorted[int(3*J/4),0] - xsim_sorted[int(J/4),0]
+    xobs_sorted = np.sort(xobs,axis=0)
+    IQR = xobs_sorted[int(3*J/4),0] - xobs_sorted[int(J/4),0]
     return rmsd / IQR
 
 def simulate_model(features, thetas):
     """returns xsim as a column vector"""
-    return (features @ thetas).reshape(-1, 1)
+    return (features @ thetas).reshape(-1,1)
 
-def linear_SLInG(features, xobs, n_iters = 500, delta_abc = 0.01, delta_min = 0.01, delta_max=10, grace_period_ratio=0.05, burn_period_ratio=0.1, sigma_initial = 1, lambda_rate=1, logging=False):
+def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 0.01, delta_max=10, grace_period_ratio=0.1, burn_period_ratio=0.2, sigma_initial = 1, lambda_rate=1, logging=False):
     """
     Linear SLInG based on algorithm from notes
     :param features:
@@ -45,11 +46,11 @@ def linear_SLInG(features, xobs, n_iters = 500, delta_abc = 0.01, delta_min = 0.
     K = features.shape[1]
 
     # Initialise epsilon and theta and sigmas (squared)
-    epsilons = np.zeros((n_iters, K))
-    thetas   = np.zeros((n_iters, K))
-    epsilons[0] = np.ones(K) #uniform(loc=0, scale=1).rvs(size=K)
+    epsilons = np.zeros((n_iters, K),dtype=np.float64)
+    thetas   = np.zeros((n_iters, K),dtype=np.float64)
+    epsilons[0] = np.ones(K,dtype=float) #uniform(loc=0, scale=1).rvs(size=K)
     thetas[0] = laplace(loc=0, scale=epsilons[0]).rvs(size=K)
-    sigmas = sigma_initial * np.ones(K)
+    sigmas = sigma_initial * np.ones(K,dtype=float)
 
     # Generate model
     xsim = simulate_model(features, thetas[0])
@@ -57,10 +58,14 @@ def linear_SLInG(features, xobs, n_iters = 500, delta_abc = 0.01, delta_min = 0.
     # Compute dist the initial distance
     dist = distance(xobs, xsim)
 
-    # delta_abc = max(delta_min, dist / delta_max)
+    delta_abc = max(delta_min, dist)
 
+    accepted = 0
+    increment = (delta_abc - delta_min) / burn_period
     # main loop
     for i in range(1, n_iters):
+        if i < burn_period:
+            delta_abc = max(delta_min, delta_abc - increment)
         if logging:
             print("Iteration %d" % i)
         # copy forward previous values by default
@@ -79,31 +84,46 @@ def linear_SLInG(features, xobs, n_iters = 500, delta_abc = 0.01, delta_min = 0.
                 eps_prop = expon(scale=1 / rate).rvs()
 
                 # acceptance ratio for ε_k:
-                #   posterior ∝ Laplace(θ_k; scale=ε) * Expon(ε; rate)
-                num = (laplace(scale=eps_prop).pdf(thetai[k]) *
-                       rate * np.exp(-rate * eps_prop))
-                den = (laplace(scale=epsi[k]).pdf(thetai[k]) *
-                       rate * np.exp(-rate * epsi[k]))
-                alpha_eps = min(1, num / den)
+                # 1) compute log‐numerator and log‐denominator
+                log_num = (
+                        laplace.logpdf(thetai[k], scale=eps_prop)
+                        + expon.logpdf(eps_prop, scale=1 / rate)
+                )
+                log_den = (
+                        laplace.logpdf(thetai[k], scale=epsi[k])
+                        + expon.logpdf(epsi[k], scale=1 / rate)
+                )
+
+                # 2) form the log‐ratio and clip it
+                log_alpha = log_num - log_den
+                log_alpha = np.clip(log_alpha, -1000, 1000)
+
+                # 3) back to normal space
+                alpha_eps = np.exp(log_alpha)
+                alpha_eps = min(1.0, alpha_eps)
 
                 if np.random.rand() < alpha_eps:
-                    epsi[k] = eps_prop
+                    epsi[k] = max(1e-5,eps_prop)
                 # else keep old epsi[k]
 
         # loop over each parameter again in the random order
         for k in perm:
             if i > burn_period / 2:
                 # compute the empirical variance of previous theta_k’s
-                past = thetas[:i, k]
+                past = thetas[max(0,i-100):i, k]
                 var = np.var(past)
-
                 # If 0 then dont update
                 if var > 1e-8:
-                    sigmas[k] = var
+                    sigmas[k] = np.sqrt(var)
 
             # Sample the proposed theta from the (normal) proposal distribution, q, centered at prev theta, variance simga
             q = norm(loc=thetai[k], scale=sigmas[k])
             theta_prop_k = q.rvs()
+            # reject auto if its outside -1000 1000
+            if np.abs(theta_prop_k) > 1000:
+                thetas[i, k] = thetas[i - 1, k]
+                continue
+
             theta_prop = thetai.copy()
             theta_prop[k] = theta_prop_k
 
@@ -116,8 +136,14 @@ def linear_SLInG(features, xobs, n_iters = 500, delta_abc = 0.01, delta_min = 0.
             # Compute the components of the accept probability
 
             # First the Kernel Ratio
-            kernel_ratio = std_normal.pdf(dist_prop/delta_abc) / std_normal.pdf(dist/delta_abc)
+            # the exponent difference:
+            log_k = std_normal.logpdf(dist_prop / delta_abc) \
+                    - std_normal.logpdf(dist / delta_abc)
 
+            # clip it into a safe range so exp() never overflows/underflows completely
+            log_k = np.clip(log_k, -700, +700)
+
+            kernel_ratio = np.exp(log_k)
             # Next prior
             prior_ratio = laplace(loc=0, scale=epsi[k]).pdf(theta_prop_k) / laplace(loc=0, scale=epsi[k]).pdf(thetai[k])
 
@@ -133,9 +159,12 @@ def linear_SLInG(features, xobs, n_iters = 500, delta_abc = 0.01, delta_min = 0.
                 xsim = xsim_prop.copy()
                 dist = dist_prop
                 thetai = theta_prop.copy()
+                accepted += 1
             else:
                 thetas[i, k] = thetas[i-1, k]
-
+        if i%100 == 0:
+            print(f"iteration {i} accepted % : {accepted / i}")
+        epsilons[i] = epsi
     return thetas
 
 
@@ -147,44 +176,45 @@ if __name__ == '__main__':
     features_df = pd.DataFrame(diabetes.data, columns=diabetes.feature_names)
     features_matrix = np.array(diabetes.data)
 
+    scaler = StandardScaler()
+    features_scaled = scaler.fit_transform(features_matrix)
+
     # Run the sling algorithm
-    theta_final = linear_SLInG(features_matrix, target, n_iters=10)
+    chain = linear_SLInG(features_scaled, target, delta_min=0.015)
 
     # Plot
-    # 1) sample for each δ
-    all_summaries = []
-    for δ in [0.015, 0.02, 0.035, 0.045]:
-        chain = linear_SLInG(features_matrix, target,  delta_abc = δ)
-        post = chain[int(0.2 * len(chain)):]  # drop 20%
-        means = post.mean(0)
-        low = np.percentile(post, 2.5, 0)
-        high = np.percentile(post, 97.5, 0)
-        all_summaries.append((δ, means, low, high))
 
-    # 2) standard deviations of original features
-    sds = features_matrix.std(axis=0, ddof=1)
+    # First we drop first 20%
+    chain = chain[int(0.2*len(chain)):]
 
-    # 3) plotting
+    # Get desired stats for the plot
+    median = np.median(chain, axis=0)
+    low = np.percentile(chain, 2.5, 0)
+    high = np.percentile(chain, 97.5, 0)
 
-    var_names = diabetes.feature_names  # length K
+    # standard deviations of original features
+    # sds = features_matrix.std(axis=0, ddof=1)
+
+    var_names = diabetes.feature_names
     K = len(var_names)
     y_pos = np.arange(K)
 
     plt.figure(figsize=(6, 4))
-    colors = ['C0', 'C1', 'C2', 'C3']
-    markers = ['^', 's', 'o', 'd']
 
-    for (δ, means, low, hi), c, m in zip(all_summaries, colors, markers):
-        # standardize if needed:
-        means_s = means * sds
-        low_s = low * sds
-        hi_s = hi * sds
+    # sd_x = features_matrix.std(axis=0, ddof=1)  # length-K
+    # sd_y = target.std(ddof=1)  # scalar
 
-        # plot interval bars
-        plt.errorbar(means_s, y_pos,
-                     xerr=[means_s - low_s, hi_s - means_s],
-                     fmt=m, color=c, label=f'δₐᵦ꜀={δ}',
-                     capsize=4, markersize=5, linestyle='none')
+    # median_s = median * sd_x / sd_y
+    # low_s = low * sd_x / sd_y
+    # high_s = high * sd_x / sd_y
+
+    xerr = np.vstack([median - low,
+                      high - median])
+
+    plt.errorbar(median, y_pos,
+                 xerr=xerr,
+                 label=f'δₐᵦ꜀={0.015}',
+                 capsize=4, markersize=5, linestyle='none')
 
     # vertical line at zero
     plt.axvline(0, color='k', lw=1, linestyle='--')
@@ -196,3 +226,51 @@ if __name__ == '__main__':
     plt.title("SLInG posterior for diabetes data")
     plt.tight_layout()
     plt.show()
+
+    import numpy as np
+    import matplotlib.pyplot as plt
+
+    # assume
+    #   chain      # your numpy array of shape (n_iters, K)
+    #   var_names  # list of length K with your parameter names
+
+    n_iters, K = chain.shape
+
+    # 1) Trace plots
+    fig, axes = plt.subplots(K, 1, figsize=(12, 2 * K), sharex=True)
+    for k in range(K):
+        axes[k].plot(chain[:, k], lw=0.5)
+        axes[k].set_ylabel(var_names[k])
+    axes[-1].set_xlabel("Iteration")
+    fig.suptitle("Trace plots of SLInG chains", y=1.02)
+    plt.tight_layout()
+    plt.show()
+
+
+    # 2) A simple ESS estimate via integrated autocorrelation time
+    def autocorr(x):
+        """Return autocorrelation of 1D array x."""
+        x = x - np.mean(x)
+        n = len(x)
+        f = np.fft.fft(x, n=2 * n)
+        acf = np.fft.ifft(f * np.conjugate(f))[:n].real
+        return acf / acf[0]
+
+
+    def integrated_autocorr_time(x, max_lag=None):
+        ac = autocorr(x)
+        if max_lag is None:
+            max_lag = len(x) // 2
+        # sum until the first negative drop (Geyer’s rule-of-thumb)
+        positive = ac[1:max_lag][ac[1:max_lag] > 0]
+        return 1 + 2 * np.sum(positive)
+
+
+    ess = np.empty(K)
+    for k in range(K):
+        tau = integrated_autocorr_time(chain[:, k])
+        ess[k] = n_iters / tau
+
+    print("Parameter   ESS   (out of {:,} samples)".format(n_iters))
+    for name, e in zip(var_names, ess):
+        print(f"{name:>5s}    {e:7.1f}")
