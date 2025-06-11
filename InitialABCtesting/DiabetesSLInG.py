@@ -18,9 +18,7 @@ def make_distance(xobs: np.ndarray):
     return distance
 
 
-def simulate_model(features, thetas):
-    """returns xsim as a column vector"""
-    return (features @ thetas).reshape(-1,1)
+
 
 def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 0.01, delta_max=10, grace_period_ratio=0.1, burn_period_ratio=0.2, sigma_initial = 1, lambda_rate=1, logging=False):
     """
@@ -52,7 +50,7 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
     sigmas = sigma_initial * np.ones(K,dtype=float)
 
     # Generate model
-    xsim = simulate_model(features, thetas[0])
+    xsim = (features @ thetas[0]).reshape(-1,1)
 
     # Initialise distance function
     distance = make_distance(xobs)
@@ -82,19 +80,23 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
             for k in perm:
                 # Need to sample epsilon k from the conditional posterior
                 # propose ε* ~ Exponential(rate=λ)  (independent MH)
-                rate = 1.0
-                eps_prop = expon(scale=1 / rate).rvs()
+                rate = 1
+                eps_prop = np.random.exponential(scale=1.0)
 
-                # acceptance ratio for ε_k:
-                # 1) compute log‐numerator and log‐denominator
-                log_num = (
-                        laplace.logpdf(thetai[k], scale=eps_prop)
-                        + expon.logpdf(eps_prop, scale=1 / rate)
-                )
-                log_den = (
-                        laplace.logpdf(thetai[k], scale=epsi[k])
-                        + expon.logpdf(epsi[k], scale=1 / rate)
-                )
+                # ---- epsilon-update: compute log-acceptance ratio ---------------
+                inv_eps_prop = 1.0 / eps_prop
+                inv_eps_old = 1.0 / epsi[k]
+
+                # Laplace log-pdf:  −log(2ε) − |θ|/ε
+                log_laplace_new = -np.log(2 * eps_prop) - np.abs(thetai[k]) * inv_eps_prop
+                log_laplace_old = -np.log(2 * epsi[k]) - np.abs(thetai[k]) * inv_eps_old
+
+                # Exponential log-pdf:  −log(β) − ε/β   (here β = 1/rate = 1.0)
+                log_expon_new = -eps_prop  # −log(1) is zero
+                log_expon_old = -epsi[k]
+
+                log_num = log_laplace_new + log_expon_new
+                log_den = log_laplace_old + log_expon_old
 
                 # 2) form the log‐ratio and clip it
                 log_alpha = log_num - log_den
@@ -119,8 +121,7 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
                     sigmas[k] = np.sqrt(var)
 
             # Sample the proposed theta from the (normal) proposal distribution, q, centered at prev theta, variance simga
-            q = norm(loc=thetai[k], scale=sigmas[k])
-            theta_prop_k = q.rvs()
+            theta_prop_k = np.random.normal(loc=thetai[k], scale=sigmas[k])
             # reject auto if its outside -1000 1000
             if np.abs(theta_prop_k) > 1000:
                 thetas[i, k] = thetas[i - 1, k]
@@ -129,8 +130,9 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
             theta_prop = thetai.copy()
             theta_prop[k] = theta_prop_k
 
-            # Simulate the model
-            xsim_prop = simulate_model(features, theta_prop)
+            # Incremental model update
+            delta = theta_prop_k - thetai[k]
+            xsim_prop = xsim + delta * features[:, k:k + 1]
 
             # Compute distance
             dist_prop = distance(xsim_prop)
@@ -147,8 +149,10 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
 
             kernel_ratio = np.exp(log_k)
             # Next prior
-            prior_ratio = laplace(loc=0, scale=epsi[k]).pdf(theta_prop_k) / laplace(loc=0, scale=epsi[k]).pdf(thetai[k])
-
+            inv_eps = 1.0 / epsi[k]
+            log_prior_new = -np.log(2 * epsi[k]) - np.abs(theta_prop_k) * inv_eps
+            log_prior_old = -np.log(2 * epsi[k]) - np.abs(thetai[k]) * inv_eps
+            prior_ratio = np.exp(log_prior_new - log_prior_old)
             # Can ignore proposal ratio q due to symmetry
 
             # Calculate alpha ensuring doesnt exceed 1
@@ -182,9 +186,7 @@ if __name__ == '__main__':
     features_scaled = scaler.fit_transform(features_matrix)
 
     # Run the sling algorithm
-    t1 = time.time()
     chain = linear_SLInG(features_scaled, target, delta_min=0.015)
-    print("time taken:", time.time() - t1)
 
     # Plot
 
