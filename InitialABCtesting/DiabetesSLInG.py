@@ -18,22 +18,20 @@ def make_distance(xobs: np.ndarray):
     return distance
 
 
-
-
-def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 0.01, delta_max=10, grace_period_ratio=0.1, burn_period_ratio=0.2, sigma_initial = 1, lambda_rate=1, logging=False):
+def linear_SLInG(features, xobs, n_iters = 10000, delta_min = 0.01, delta_max=10, grace_ratio=0.1, burn_period_ratio=0.2, sigma_initial = 1, lambda_rate=1, logging=False):
     """
     Linear SLInG based on algorithm from notes
     :param features:
     :param xobs:
     :param n_iters:
     :param delta_abc:
-    :param grace_period_ratio:
+    :param grace_ratio:
     :param burn_period_ratio:
     :param sigma_initial:
     :return:
     """
     # Determine number of iters for grace period and burn in phase
-    grace_period = int(grace_period_ratio * n_iters)
+    grace_period = int(grace_ratio * n_iters)
     burn_period = int(burn_period_ratio * n_iters)
 
     # Initialise a standard normal distribution for our kernel
@@ -60,17 +58,21 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
 
     delta_abc = max(delta_min, dist)
 
+    # We will store the number of accepted chains
     accepted = 0
+
+    # Linearly decrease delta_abc to the min value within the burn period
     increment = (delta_abc - delta_min) / burn_period
+
     # main loop
     for i in range(1, n_iters):
+        # Update the delta_abc if in the burn period
         if i < burn_period:
             delta_abc = max(delta_min, delta_abc - increment)
-        if logging:
-            print("Iteration %d" % i)
+
         # copy forward previous values by default
-        epsi = epsilons[i-1].copy()
-        thetai = thetas[i-1].copy()
+        eps_current = epsilons[i-1].copy()
+        theta_current = thetas[i-1].copy()
 
         # shuffle order of updates - we dont alter the order that theyre stored just that theyre accessed
         perm = np.random.permutation(K)
@@ -78,42 +80,42 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
         # Only update epsilons if after the grace period
         if i > grace_period:
             for k in perm:
-                # Need to sample epsilon k from the conditional posterior
-                # propose ε* ~ Exponential(rate=λ)  (independent MH)
-                rate = 1
+                # Need to sample epsilon k from the conditional posterior - we do so from the exponential distribution
                 eps_prop = np.random.exponential(scale=1.0)
 
-                # ---- epsilon-update: compute log-acceptance ratio ---------------
+                # We will make use of the log-pdf for numerical stability
                 inv_eps_prop = 1.0 / eps_prop
-                inv_eps_old = 1.0 / epsi[k]
+                inv_eps_old = 1.0 / eps_current[k]
 
                 # Laplace log-pdf:  −log(2ε) − |θ|/ε
-                log_laplace_new = -np.log(2 * eps_prop) - np.abs(thetai[k]) * inv_eps_prop
-                log_laplace_old = -np.log(2 * epsi[k]) - np.abs(thetai[k]) * inv_eps_old
+                log_laplace_new = -np.log(2 * eps_prop) - np.abs(theta_current[k]) * inv_eps_prop
+                log_laplace_old = -np.log(2 * eps_current[k]) - np.abs(theta_current[k]) * inv_eps_old
 
-                # Exponential log-pdf:  −log(β) − ε/β   (here β = 1/rate = 1.0)
-                log_expon_new = -eps_prop  # −log(1) is zero
-                log_expon_old = -epsi[k]
+                # Exponential log-pdf:  −log(β) − ε/β  here β = 1/rate = 1.0
+                log_expon_new = -eps_prop
+                log_expon_old = -eps_current[k]
 
                 log_num = log_laplace_new + log_expon_new
                 log_den = log_laplace_old + log_expon_old
 
-                # 2) form the log‐ratio and clip it
+                # Form the log‐ratio and clip it - for numerical stability
                 log_alpha = log_num - log_den
                 log_alpha = np.clip(log_alpha, -1000, 1000)
 
-                # 3) back to normal space
+                # Back to normal space
                 alpha_eps = np.exp(log_alpha)
                 alpha_eps = min(1.0, alpha_eps)
 
+                # Simulate random number to determine whether we accept otherwise remains same
                 if np.random.rand() < alpha_eps:
-                    epsi[k] = max(1e-5,eps_prop)
-                # else keep old epsi[k]
+                    # Prevent epsilon from getting too small
+                    eps_current[k] = max(1e-5,eps_prop)
 
-        # loop over each parameter again in the random order
+
+        # Now we loop over the theta's
         for k in perm:
             if i > burn_period / 2:
-                # compute the empirical variance of previous theta_k’s
+                # compute the empirical variance of previous theta_k’s - will only use the past 100 values
                 past = thetas[max(0,i-100):i, k]
                 var = np.var(past)
                 # If 0 then dont update
@@ -121,17 +123,17 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
                     sigmas[k] = np.sqrt(var)
 
             # Sample the proposed theta from the (normal) proposal distribution, q, centered at prev theta, variance simga
-            theta_prop_k = np.random.normal(loc=thetai[k], scale=sigmas[k])
+            theta_prop_k = np.random.normal(loc=theta_current[k], scale=sigmas[k])
             # reject auto if its outside -1000 1000
             if np.abs(theta_prop_k) > 1000:
                 thetas[i, k] = thetas[i - 1, k]
                 continue
 
-            theta_prop = thetai.copy()
+            theta_prop = theta_current.copy()
             theta_prop[k] = theta_prop_k
 
-            # Incremental model update
-            delta = theta_prop_k - thetai[k]
+            # Incremental model update - for efficiency
+            delta = theta_prop_k - theta_current[k]
             xsim_prop = xsim + delta * features[:, k:k + 1]
 
             # Compute distance
@@ -141,18 +143,18 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
 
             # First the Kernel Ratio
             # the exponent difference:
-            log_k = std_normal.logpdf(dist_prop / delta_abc) \
-                    - std_normal.logpdf(dist / delta_abc)
+            log_k = std_normal.logpdf(dist_prop / delta_abc) - std_normal.logpdf(dist / delta_abc)
 
             # clip it into a safe range so exp() never overflows/underflows completely
             log_k = np.clip(log_k, -700, +700)
-
             kernel_ratio = np.exp(log_k)
+
             # Next prior
-            inv_eps = 1.0 / epsi[k]
-            log_prior_new = -np.log(2 * epsi[k]) - np.abs(theta_prop_k) * inv_eps
-            log_prior_old = -np.log(2 * epsi[k]) - np.abs(thetai[k]) * inv_eps
+            inv_eps = 1.0 / eps_current[k]
+            log_prior_new = -np.log(2 * eps_current[k]) - np.abs(theta_prop_k) * inv_eps
+            log_prior_old = -np.log(2 * eps_current[k]) - np.abs(theta_current[k]) * inv_eps
             prior_ratio = np.exp(log_prior_new - log_prior_old)
+
             # Can ignore proposal ratio q due to symmetry
 
             # Calculate alpha ensuring doesnt exceed 1
@@ -164,85 +166,19 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
                 thetas[i, k] = theta_prop_k
                 xsim = xsim_prop.copy()
                 dist = dist_prop
-                thetai = theta_prop.copy()
+                theta_current = theta_prop.copy()
                 accepted += 1
             else:
                 thetas[i, k] = thetas[i-1, k]
         if i%100 == 0:
             print(f"iteration {i} accepted % : {accepted / i}")
-        epsilons[i] = epsi
+        epsilons[i] = eps_current
     return thetas
 
-
-
-if __name__ == '__main__':
-    # Load the dataset
-    diabetes = load_diabetes()
-    target = np.array(diabetes.target).reshape(-1, 1)
-    features_df = pd.DataFrame(diabetes.data, columns=diabetes.feature_names)
-    features_matrix = np.array(diabetes.data)
-
-    scaler = StandardScaler()
-    features_scaled = scaler.fit_transform(features_matrix)
-
-    # Run the sling algorithm
-    chain = linear_SLInG(features_scaled, target, delta_min=0.015)
-
-    # Plot
-
-    # First we drop first 20%
-    chain = chain[int(0.2*len(chain)):]
-
-    # Get desired stats for the plot
-    median = np.median(chain, axis=0)
-    low = np.percentile(chain, 2.5, 0)
-    high = np.percentile(chain, 97.5, 0)
-
-    # standard deviations of original features
-    # sds = features_matrix.std(axis=0, ddof=1)
-
+def trace_plots(chain):
     var_names = diabetes.feature_names
-    K = len(var_names)
-    y_pos = np.arange(K)
-
-    plt.figure(figsize=(6, 4))
-
-    # sd_x = features_matrix.std(axis=0, ddof=1)  # length-K
-    # sd_y = target.std(ddof=1)  # scalar
-
-    # median_s = median * sd_x / sd_y
-    # low_s = low * sd_x / sd_y
-    # high_s = high * sd_x / sd_y
-
-    xerr = np.vstack([median - low,
-                      high - median])
-
-    plt.errorbar(median, y_pos,
-                 xerr=xerr,
-                 label=f'δₐᵦ꜀={0.015}',
-                 capsize=4, markersize=5, linestyle='none')
-
-    # vertical line at zero
-    plt.axvline(0, color='k', lw=1, linestyle='--')
-
-    plt.yticks(y_pos, var_names)
-    plt.xlabel("Standardized coefficients")
-    plt.ylim(-1, K)
-    plt.legend(loc='upper right', frameon=False)
-    plt.title("SLInG posterior for diabetes data")
-    plt.tight_layout()
-    plt.show()
-
-    import numpy as np
-    import matplotlib.pyplot as plt
-
-    # assume
-    #   chain      # your numpy array of shape (n_iters, K)
-    #   var_names  # list of length K with your parameter names
-
     n_iters, K = chain.shape
 
-    # 1) Trace plots
     fig, axes = plt.subplots(K, 1, figsize=(12, 2 * K), sharex=True)
     for k in range(K):
         axes[k].plot(chain[:, k], lw=0.5)
@@ -253,30 +189,100 @@ if __name__ == '__main__':
     plt.show()
 
 
-    # 2) A simple ESS estimate via integrated autocorrelation time
-    def autocorr(x):
-        """Return autocorrelation of 1D array x."""
-        x = x - np.mean(x)
-        n = len(x)
-        f = np.fft.fft(x, n=2 * n)
-        acf = np.fft.ifft(f * np.conjugate(f))[:n].real
-        return acf / acf[0]
+def run_and_plot_sling(
+    features: np.ndarray,
+    y_obs: np.ndarray,
+    *,
+    delta_list=(0.015, 0.02, 0.035, 0.045),
+    n_iters=10_000,
+    burn_in=0.20,
+    grace_ratio=0.10,
+    burn_ratio=0.20,
+    seed=0,
+):
+    """
+    Always-standardise-X version.
+    Runs `linear_SLInG` for each δ_min and plots the error-bar forest.
+
+    Parameters
+    ----------
+    features : ndarray (N × K)  – raw predictors (not yet scaled)
+    y_obs    : ndarray (N × 1)  – response
+    Other args: see docstring in earlier version.
+    """
+    rng = np.random.default_rng(seed)
+
+    scaler   = StandardScaler()
+    X_scaled = scaler.fit_transform(features)   # each column: mean 0, sd 1
+    sd_x     = scaler.scale_                   # original σ_x  (length-K)
 
 
-    def integrated_autocorr_time(x, max_lag=None):
-        ac = autocorr(x)
-        if max_lag is None:
-            max_lag = len(x) // 2
-        # sum until the first negative drop (Geyer’s rule-of-thumb)
-        positive = ac[1:max_lag][ac[1:max_lag] > 0]
-        return 1 + 2 * np.sum(positive)
+    colours  = ["tab:blue", "tab:orange", "tab:green", "tab:red"]
+    markers  = ["^", ">", "<", "v"]
+    offsets  = np.linspace(-0.25, 0.25, len(delta_list))
+
+    var_names = diabetes.feature_names         # K = 10 here
+    y_pos     = np.arange(len(var_names))
+
+    plt.figure(figsize=(7, 4))
+    summary = {}
+
+    # loop over δ
+    for δ, dx, col, mk in zip(delta_list, offsets, colours, markers):
+        chain = linear_SLInG(
+            X_scaled, y_obs,
+            n_iters=n_iters,
+            delta_min=δ,
+            grace_ratio=grace_ratio,
+            burn_period_ratio=burn_ratio,
+            logging=False,
+        )
+
+        chain = chain[int(burn_in * len(chain)):]        # drop burn-in
+        chain_std = chain / sd_x               # rescale for plot
+
+        med  = np.median(chain_std, axis=0)
+        low  = np.percentile(chain_std,  2.5, axis=0)
+        high = np.percentile(chain_std, 97.5, axis=0)
+        xerr = np.vstack([med - low, high - med])
+
+        summary[δ] = {"median": med, "low": low, "high": high}
+
+        plt.errorbar(
+            med, y_pos + dx,
+            xerr=xerr,
+            fmt=mk, color=col,
+            capsize=4, markersize=5, linestyle="none",
+            label=fr"$\delta_{{ABC}} = {δ}$",
+        )
+
+    # styling
+    plt.axvline(0, color="k", lw=1, ls="--")
+    plt.yticks(y_pos, var_names)
+    plt.xlabel("Standardized coefficients")
+    plt.ylim(-1, len(var_names))
+    plt.legend(loc="upper right", frameon=False)
+    plt.title("SLInG posterior for diabetes data")
+    plt.tight_layout()
+    plt.show()
+
+    return summary
 
 
-    ess = np.empty(K)
-    for k in range(K):
-        tau = integrated_autocorr_time(chain[:, k])
-        ess[k] = n_iters / tau
+if __name__ == "__main__":
+    diabetes = load_diabetes()
+    X_raw    = diabetes.data
+    y_raw    = diabetes.target.reshape(-1, 1)
 
-    print("Parameter   ESS   (out of {:,} samples)".format(n_iters))
-    for name, e in zip(var_names, ess):
-        print(f"{name:>5s}    {e:7.1f}")
+    # run trace plot on one δ for illustration
+    chain = linear_SLInG(StandardScaler().fit_transform(X_raw), y_raw, delta_min=0.015)
+    # discard burn in period
+    chain = chain[int(0.2 * len(chain)):]
+    trace_plots(chain)
+
+    # reproduce the multi-δ figure
+    run_and_plot_sling(X_raw, y_raw, n_iters=50000)
+
+
+
+
