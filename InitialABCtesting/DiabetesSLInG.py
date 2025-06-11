@@ -1,3 +1,4 @@
+import time
 import scipy
 from sklearn.datasets import load_diabetes
 import pandas as pd
@@ -6,18 +7,16 @@ from scipy.stats import laplace, uniform, norm, expon
 import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 
-def distance(xobs, xsim):
-    """Function to calculate the distance between observations and simulated observations given by RMSD / IQR"""
-    # Get number of observations
-    J = xobs.shape[0]
+def make_distance(xobs: np.ndarray):
+    """Return a distance function bound to xobs."""
+    iqr = np.subtract(*np.percentile(xobs, [75, 25]))
 
-    # Compute the root mean squared distance between observed and simulated
-    rmsd = np.sqrt(np.sum((xobs - xsim) ** 2) / J)
+    def distance(xsim: np.ndarray) -> float:
+        rmsd = np.sqrt(np.mean((xobs - xsim) ** 2))
+        return rmsd / iqr
 
-    # Calculate the IQR
-    xobs_sorted = np.sort(xobs,axis=0)
-    IQR = xobs_sorted[int(3*J/4),0] - xobs_sorted[int(J/4),0]
-    return rmsd / IQR
+    return distance
+
 
 def simulate_model(features, thetas):
     """returns xsim as a column vector"""
@@ -55,8 +54,11 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
     # Generate model
     xsim = simulate_model(features, thetas[0])
 
+    # Initialise distance function
+    distance = make_distance(xobs)
+
     # Compute dist the initial distance
-    dist = distance(xobs, xsim)
+    dist = distance(xsim)
 
     delta_abc = max(delta_min, dist)
 
@@ -131,7 +133,7 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_abc = 0.01, delta_min = 
             xsim_prop = simulate_model(features, theta_prop)
 
             # Compute distance
-            dist_prop = distance(xobs, xsim_prop)
+            dist_prop = distance(xsim_prop)
 
             # Compute the components of the accept probability
 
@@ -180,7 +182,9 @@ if __name__ == '__main__':
     features_scaled = scaler.fit_transform(features_matrix)
 
     # Run the sling algorithm
+    t1 = time.time()
     chain = linear_SLInG(features_scaled, target, delta_min=0.015)
+    print("time taken:", time.time() - t1)
 
     # Plot
 
