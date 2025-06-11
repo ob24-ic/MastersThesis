@@ -8,7 +8,41 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 
 def make_distance(xobs: np.ndarray):
-    """Return a distance function bound to xobs."""
+    """
+    Build a fast distance function *pre-bound* to the observed data.
+
+    The returned callable computes
+
+    .. math::
+
+        d(x_{\text{obs}}, x_{\text{sim}}) \;=\;
+        \frac{\sqrt{\frac{1}{N}\sum_i (x_{\text{obs},i}-x_{\text{sim},i})^2}}
+             {\operatorname{IQR}(x_{\text{obs}})}
+
+    i.e. the root-mean-squared deviation (RMSD) between observed and
+    simulated vectors, scaled by the interquartile range of the observed
+    data.  Because the IQR is fixed, it is computed **once** and captured
+    in the closure, making every subsequent distance call O(*N*) instead
+    of O(*N* + sort).
+
+    Parameters
+    ----------
+    xobs : ndarray, shape (N,) or (N, 1)
+        Observed response vector.  Can be 1-D or a column vector.
+
+    Returns
+    -------
+    distance : callable
+        A single-argument function ``distance(xsim)`` that returns a
+        float—RMSD/IQR—for any simulated vector of the same length.
+
+    Examples
+    --------
+    >>> y_obs = np.array([1.2, 0.7, 3.4, 2.2])
+    >>> dist  = make_distance(y_obs)
+    >>> y_sim = np.array([1.0, 0.9, 3.3, 2.0])
+    >>> dist(y_sim)
+    """
     iqr = np.subtract(*np.percentile(xobs, [75, 25]))
 
     def distance(xsim: np.ndarray) -> float:
@@ -18,17 +52,98 @@ def make_distance(xobs: np.ndarray):
     return distance
 
 
-def linear_SLInG(features, xobs, n_iters = 10000, delta_min = 0.01, delta_max=10, grace_ratio=0.1, burn_period_ratio=0.2, sigma_initial = 1, lambda_rate=1, logging=False):
+
+def linear_SLInG(
+    features: np.ndarray,
+    xobs: np.ndarray,
+    n_iters: int = 10_000,
+    delta_min: float = 0.01,
+    delta_max: float = 10.0,
+    grace_ratio: float = 0.10,
+    burn_period_ratio: float = 0.20,
+    sigma_initial: float = 1.0,
+    lambda_rate: float = 1.0,
+    logging: bool = False,
+) -> np.ndarray:
     """
-    Linear SLInG based on algorithm from notes
-    :param features:
-    :param xobs:
-    :param n_iters:
-    :param delta_abc:
-    :param grace_ratio:
-    :param burn_period_ratio:
-    :param sigma_initial:
-    :return:
+    Run the **Linear SLInG** (Simulation‐Based Likelihood-free Inference with
+    Gibbs updates) algorithm for a standard linear forward model *x = X θ*.
+
+    The sampler alternates between
+
+    1. **ε–updates** (component-wise draws from an exponential proposal
+       followed by MH acceptance) and
+    2. **θ–updates** (random-walk Metropolis with distance-based ABC kernel),
+
+    while slowly annealing the ABC tolerance *δ<sub>ABC</sub>* from its
+    initial RMSD/IQR down to ``delta_min``.
+
+    Parameters
+    ----------
+    features : (N, K) ndarray
+        Design matrix ``X``.  Columns should be centred; scaling to unit
+        variance is recommended for numerical stability.
+    xobs : (N, 1) or (N,) ndarray
+        Observed response vector ``y``.
+    n_iters : int, default ``10_000``
+        Total number of MCMC iterations.
+    delta_min : float, default ``0.01``
+        Lower bound to which the ABC tolerance *δ<sub>ABC</sub>* is
+        annealed during burn-in.
+    delta_max : float, default ``10``
+        *Currently unused*: kept for API compatibility with earlier drafts.
+    grace_ratio : float in (0, 1), default ``0.10``
+        Fraction of iterations during which ε<sub>k</sub> are **not**
+        updated (a “grace period” that lets θ adapt first).
+    burn_period_ratio : float in (0, 1), default ``0.20``
+        Length of the *δ*-annealing schedule as a fraction of
+        ``n_iters``.
+    sigma_initial : float, default ``1.0``
+        Initial proposal standard deviation for every θ<sub>k</sub>.  After
+        half the burn-in the code adaptively replaces this with the
+        empirical σ of the last 100 θ-draws.
+    lambda_rate : float, default ``1.0``
+        Rate parameter of the exponential proposal for ε.  (Kept
+        explicit so you can experiment, but the body hard-codes β = 1.)
+    logging : bool, default ``False``
+        If *True*, prints the per-parameter acceptance probability each
+        time a θ move is proposed and a summary every 100 iterations.
+
+    Returns
+    -------
+    thetas : ndarray, shape (n_iters, K)
+        The full MCMC chain of regression-coefficient draws (including
+        burn-in and grace period).  Discard the first
+        ``burn_in = burn_period_ratio × n_iters`` rows if you want the
+        post-burn sample only.
+
+    Notes
+    -----
+    *Distance metric*
+        ``make_distance(xobs)`` pre-computes the IQR of the observed data
+        so each RMSD evaluation is O(*N*).  The kernel is a standard
+        normal PDF on the scaled distance.
+
+    *Incremental forward model*
+        Because only one θ<sub>k</sub> changes in each inner loop, the
+        candidate simulation ``xsim_prop`` is updated with a cheap
+        rank-1 operation::
+
+            xsim_prop = xsim + (θ*_k − θ_k) · X[:, k]
+
+        avoiding a fresh ``X @ θ`` multiplication.
+
+    *Numerical safeguards*
+        The code clips log-ratios to ±1000 (ε-step) and ±700 (kernel step)
+        to prevent overflow/underflow in ``np.exp``.
+
+    Examples
+    --------
+    >>> diabetes = load_diabetes()
+    >>> X        = StandardScaler().fit_transform(diabetes.data)
+    >>> y        = diabetes.target.reshape(-1, 1)
+    >>> chain    = linear_SLInG(X, y, n_iters=20_000, delta_min=0.015)
+    >>> chain    = chain[int(0.2 * len(chain)):]   # drop 20 % burn-in
     """
     # Determine number of iters for grace period and burn in phase
     grace_period = int(grace_ratio * n_iters)
@@ -176,6 +291,31 @@ def linear_SLInG(features, xobs, n_iters = 10000, delta_min = 0.01, delta_max=10
     return thetas
 
 def trace_plots(chain):
+    """
+    Quick diagnostic trace plot for a SLInG (or any MCMC) coefficient matrix.
+
+    Parameters
+    ----------
+    chain : ndarray, shape (n_iters, K)
+        The sampled parameter matrix.  Each column corresponds to a single
+        regression coefficient; each row is one MCMC iteration **after any
+        burn-in you wish to discard**.
+
+    Notes
+    -----
+    • The helper grabs the diabetes-dataset variable names from the global
+      ``diabetes`` object, so call it only *after* you have executed
+      ``diabetes = load_diabetes()``.
+    • Line width is set to 0.5 for speed and clarity on long chains.
+    • The y-axis is individually labelled for every coefficient; the x-axis
+      (iteration index) is shared.
+
+    Example
+    -------
+    >>> chain = linear_SLInG(X_scaled, y, n_iters=15_000, delta_min=0.02)
+    >>> chain = chain[int(0.2 * len(chain)):]   # drop 20 % burn-in
+    >>> trace_plots(chain)
+    """
     var_names = diabetes.feature_names
     n_iters, K = chain.shape
 
@@ -189,26 +329,85 @@ def trace_plots(chain):
     plt.show()
 
 
+
 def run_and_plot_sling(
     features: np.ndarray,
     y_obs: np.ndarray,
     *,
     delta_list=(0.015, 0.02, 0.035, 0.045),
-    n_iters=10_000,
-    burn_in=0.20,
-    grace_ratio=0.10,
-    burn_ratio=0.20,
-    seed=0,
+    n_iters: int = 10_000,
+    burn_in: float = 0.20,
+    grace_ratio: float = 0.10,
+    burn_ratio: float = 0.20,
+    seed: int = 0,
 ):
     """
-    Always-standardise-X version.
-    Runs `linear_SLInG` for each δ_min and plots the error-bar forest.
+    Fit and visualise a family of SLInG posterior chains for the
+    scikit-learn diabetes data (or any linear-regression design matrix).
+
+    The helper does three things:
+
+    1. **Standardises** every predictor column (mean 0, variance 1) before
+       sampling – this usually speeds up convergence.
+    2. Runs :pyfunc:`linear_SLInG` once for each value in ``delta_list``.
+    3. Converts the raw θ-draws back to the “paper” scale
+       by **dividing** each coefficient by the pre-scaling standard deviation
+       of its predictor, then plots a forest of error bars.
 
     Parameters
     ----------
-    features : ndarray (N × K)  – raw predictors (not yet scaled)
-    y_obs    : ndarray (N × 1)  – response
-    Other args: see docstring in earlier version.
+    features : (N, K) ndarray
+        Raw design matrix ``X``. Columns are centred and scaled internally;
+        the original values are only used to compute each column’s
+        standard deviation ``sd_x`` for the final rescaling step.
+    y_obs : (N, 1) or (N,) ndarray
+        Response vector ``y`` in its original units. It is *not* scaled.
+    delta_list : sequence of float, default ``(0.015, 0.02, 0.035, 0.045)``
+        The ℓ₂ thresholds δₐᵦ꜀ (one per coloured chain) to compare.
+    n_iters : int, default ``10 000``
+        Number of MCMC iterations in each SLInG run.
+    burn_in : float in (0, 1), default ``0.20``
+        Fraction of samples discarded as burn-in before summarising.
+    grace_ratio : float in (0, 1), default ``0.10``
+        Initial fraction of iterations during which ε-adaptation is *not*
+        attempted (mirrors the algorithm’s “grace period”).
+    burn_ratio : float in (0, 1), default ``0.20``
+        Fraction of iterations over which δₐᵦ꜀ is tapered from its initial
+        value down to ``delta_min`` (the “burn-in schedule” in SLInG).
+    seed : int, default ``0``
+        Seed passed to NumPy’s random generator for reproducible chains.
+
+    Returns
+    -------
+    summary : dict[float, dict[str, ndarray]]
+        A nested dictionary keyed by each δ.  For every threshold the inner
+        dict contains
+
+        * ``"median"`` – posterior medians (shape ``(K,)``)
+        * ``"low"``    – 2.5 % posterior quantiles
+        * ``"high"``   – 97.5 % posterior quantiles
+
+        All arrays are on the **rescaled** (paper) axis.
+
+    Notes
+    -----
+    *Predictor rescaling*:
+    After sampling on the unit-variance design matrix ``X_scaled``, every
+    coefficient sample ``θ_j`` is divided by the original column standard
+    deviation ``sd_x[j]``.  That matches the convention used in the
+    original SLInG paper, where coefficients lie in the hundreds.
+
+    *Plot*:
+    The function draws a horizontal error-bar plot (“forest plot”) with a
+    tiny vertical jitter so the four δ levels do not occlude each other.
+    Colours and marker shapes follow the figure in the paper
+    (blue ▲, orange ▶, green ◀, red ▼).
+
+    Examples
+    --------
+    >>> diabetes = load_diabetes()
+    >>> run_and_plot_sling(diabetes.data, diabetes.target[:, None],
+    ...                    n_iters=50_000, seed=42)
     """
     rng = np.random.default_rng(seed)
 
